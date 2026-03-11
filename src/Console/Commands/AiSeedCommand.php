@@ -44,6 +44,14 @@ class AiSeedCommand extends Command
      */
     protected $description = 'Generate smart, context-aware dummy data for a database table using AI';
 
+    /**
+     * Buffered warnings collected during the silent progress-bar loop.
+     * Printed only after the progress bar is safely closed.
+     *
+     * @var array<int, string>
+     */
+    private array $bufferedWarnings = [];
+
     public function __construct(
         private readonly SchemaAnalyzerInterface $schemaAnalyzer,
         private readonly RelationshipResolverInterface $relationshipResolver,
@@ -136,12 +144,13 @@ class AiSeedCommand extends Command
         // ── Step 5: Generate & insert per chunk ──
         $totalInserted = 0;
         $tokenTracker = new TokenUsageTracker;
+        $this->bufferedWarnings = [];
 
         // Schema metadata for the auto-mutation retry logic
         $nonMutableColumns = $this->resolveNonMutableColumns($schema);
 
-        // Single global progress bar across all chunks
-        $progress = new \Laravel\Prompts\Progress('💾 Inserting rows into ['.$table.']', $count);
+        // Single global progress bar — absolutely ZERO console output inside the loop.
+        $progress = new \Laravel\Prompts\Progress('🧠 Generating and inserting AI data', $chunks);
         $progress->start();
 
         try {
@@ -149,34 +158,32 @@ class AiSeedCommand extends Command
                 $remaining = $count - $totalInserted;
                 $currentChunkSize = min($chunkSize, $remaining);
 
-                // 5a: AI generation with spinner
-                info("🧠 Generating chunk {$chunk}/{$chunks} ({$currentChunkSize} rows)...");
+                $progress->hint("Waiting for AI… chunk {$chunk}/{$chunks} ({$currentChunkSize} rows)");
+                $progress->render();
 
-                /** @var GenerationResult $result */
-                $result = spin(
-                    callback: fn () => $this->dataGenerator->generate(
-                        $schema,
-                        $currentChunkSize,
-                        $foreignKeyConstraints,
-                        $language,
-                        $contextCode,
-                    ),
-                    message: 'Waiting for AI to generate data (this may take a moment)...',
+                $result = $this->dataGenerator->generate(
+                    $schema,
+                    $currentChunkSize,
+                    $foreignKeyConstraints,
+                    $language,
+                    $contextCode,
                 );
 
                 $tokenTracker->add($result->promptTokens, $result->completionTokens);
 
-                note('  ✓ AI returned '.count($result->rows)." row(s). Tokens: {$result->promptTokens} prompt + {$result->completionTokens} completion.");
+                $progress->hint("Inserting chunk {$chunk}/{$chunks} into [{$table}]…");
+                $progress->render();
 
-                // 5b: Insert rows one-by-one with duplicate auto-mutation
                 foreach ($result->rows as $row) {
                     $this->insertWithRetry($table, $row, $nonMutableColumns);
                     $totalInserted++;
-                    $progress->advance();
                 }
+
+                $progress->advance();
             }
         } catch (\Throwable $e) {
             $progress->finish();
+            $this->flushBufferedWarnings();
             $this->newLine();
             error("Failed to seed [{$table}]: {$e->getMessage()}");
 
@@ -190,6 +197,7 @@ class AiSeedCommand extends Command
         }
 
         $progress->finish();
+        $this->flushBufferedWarnings();
 
         // ── Step 6: Summary ──
         $this->newLine();
@@ -391,10 +399,12 @@ class AiSeedCommand extends Command
      * If a duplicate entry is detected, mutable string columns are suffixed
      * with a random string to force uniqueness, and the row is re-inserted.
      *
+     * Warnings are buffered (not printed) so the progress bar is never interrupted.
+     *
      * @param  array<string, mixed>  $row
      * @param  array<int, string>  $nonMutableColumns  Column names that should NOT be mutated (JSON, dates, FKs, enums, etc.)
      *
-     * @throws QueryException  If the error is not a unique constraint violation or retry also fails.
+     * @throws QueryException  If the error is not a unique constraint violation or all retries fail.
      */
     private function insertWithRetry(string $table, array $row, array $nonMutableColumns, int $maxRetries = 3): void
     {
@@ -424,9 +434,24 @@ class AiSeedCommand extends Command
                     }
                 }
 
-                warning("  ⚠ Duplicate entry detected — mutated row and retrying (attempt {$attempt}/{$maxRetries})...");
+                // Buffer warning — never print while progress bar is active
+                $this->bufferedWarnings[] = "Duplicate entry in [{$table}] — mutated row and retried (attempt {$attempt}/{$maxRetries}).";
             }
         }
+    }
+
+    /**
+     * Flush all buffered warnings to the console.
+     *
+     * Must only be called AFTER the progress bar has been closed with finish().
+     */
+    private function flushBufferedWarnings(): void
+    {
+        foreach ($this->bufferedWarnings as $msg) {
+            warning("  ⚠ {$msg}");
+        }
+
+        $this->bufferedWarnings = [];
     }
 
     /**
