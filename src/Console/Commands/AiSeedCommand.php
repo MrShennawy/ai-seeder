@@ -148,6 +148,7 @@ class AiSeedCommand extends Command
 
         // Schema metadata for the auto-mutation retry logic
         $nonMutableColumns = $this->resolveNonMutableColumns($schema);
+        $columnMaxLengths = $this->resolveColumnMaxLengths($schema);
 
         // Single global progress bar — absolutely ZERO console output inside the loop.
         $progress = new \Laravel\Prompts\Progress('🧠 Generating and inserting AI data', $chunks);
@@ -175,7 +176,7 @@ class AiSeedCommand extends Command
                 $progress->render();
 
                 foreach ($result->rows as $row) {
-                    $this->insertWithRetry($table, $row, $nonMutableColumns);
+                    $this->insertWithRetry($table, $row, $nonMutableColumns, $columnMaxLengths);
                     $totalInserted++;
                 }
 
@@ -396,17 +397,24 @@ class AiSeedCommand extends Command
      * Insert a single row into the database, with auto-mutation retry
      * on unique constraint violations (SQLSTATE 23000 / error code 1062).
      *
-     * If a duplicate entry is detected, mutable string columns are suffixed
-     * with a random string to force uniqueness, and the row is re-inserted.
+     * Uses a smart, column-name-aware mutation strategy:
+     * - Phone columns: replaces trailing digits to keep a valid format.
+     * - Email columns: injects a random tag before the @ sign.
+     * - Other known unique-prone columns (code, slug, sku, username): appends a short suffix.
+     * - Generic long strings (>15 chars): appends a suffix as a fallback.
+     * - Short generic strings (language, status, etc.): never touched.
+     *
+     * All mutations respect the column's max_length from the schema.
      *
      * Warnings are buffered (not printed) so the progress bar is never interrupted.
      *
      * @param  array<string, mixed>  $row
-     * @param  array<int, string>  $nonMutableColumns  Column names that should NOT be mutated (JSON, dates, FKs, enums, etc.)
+     * @param  array<int, string>  $nonMutableColumns  Column names that should NOT be mutated
+     * @param  array<string, int>  $columnMaxLengths  Column name → max_length map from schema
      *
      * @throws QueryException  If the error is not a unique constraint violation or all retries fail.
      */
-    private function insertWithRetry(string $table, array $row, array $nonMutableColumns, int $maxRetries = 3): void
+    private function insertWithRetry(string $table, array $row, array $nonMutableColumns, array $columnMaxLengths = [], int $maxRetries = 3): void
     {
         for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
             try {
@@ -414,7 +422,6 @@ class AiSeedCommand extends Command
 
                 return;
             } catch (QueryException $e) {
-                // Only handle unique constraint violations (SQLSTATE 23000, MySQL error 1062)
                 if ($e->errorInfo[0] !== '23000' || ($e->errorInfo[1] ?? 0) != 1062) {
                     throw $e;
                 }
@@ -423,21 +430,80 @@ class AiSeedCommand extends Command
                     throw $e;
                 }
 
-                // Mutate mutable string columns to force uniqueness
-                foreach ($row as $column => $value) {
-                    if (in_array($column, $nonMutableColumns, true)) {
-                        continue;
-                    }
+                $row = $this->mutateRowForUniqueness($row, $nonMutableColumns, $columnMaxLengths);
 
-                    if (is_string($value) && $value !== '') {
-                        $row[$column] = $value.'-'.Str::random(4);
-                    }
-                }
-
-                // Buffer warning — never print while progress bar is active
                 $this->bufferedWarnings[] = "Duplicate entry in [{$table}] — mutated row and retried (attempt {$attempt}/{$maxRetries}).";
             }
         }
+    }
+
+    /**
+     * Mutate a row's string values to resolve a unique constraint violation.
+     *
+     * @param  array<string, mixed>  $row
+     * @param  array<int, string>  $nonMutableColumns
+     * @param  array<string, int>  $columnMaxLengths
+     * @return array<string, mixed>
+     */
+    private function mutateRowForUniqueness(array $row, array $nonMutableColumns, array $columnMaxLengths): array
+    {
+        // Column names that are commonly subject to unique constraints.
+        // These are ALWAYS eligible for mutation regardless of string length.
+        $knownUniqueColumns = ['email', 'phone', 'code', 'slug', 'username', 'sku', 'mobile', 'telephone', 'coupon_code'];
+
+        foreach ($row as $column => $value) {
+            if (in_array($column, $nonMutableColumns, true)) {
+                continue;
+            }
+
+            if (! is_string($value) || $value === '') {
+                continue;
+            }
+
+            $lowerColumn = strtolower($column);
+            $isKnownUnique = in_array($lowerColumn, $knownUniqueColumns, true)
+                || str_contains($lowerColumn, 'phone')
+                || str_contains($lowerColumn, 'email')
+                || str_contains($lowerColumn, 'slug');
+
+            // Skip short generic strings that are unlikely to be unique-constrained
+            if (! $isKnownUnique && mb_strlen($value) <= 15) {
+                continue;
+            }
+
+            $maxLen = $columnMaxLengths[$column] ?? null;
+
+            // Phone columns: replace trailing digits to keep a valid phone format
+            if (str_contains($lowerColumn, 'phone') || str_contains($lowerColumn, 'mobile') || $lowerColumn === 'telephone') {
+                $row[$column] = preg_replace('/\d{4}$/', (string) rand(1000, 9999), $value) ?? $value;
+                continue;
+            }
+
+            // Email columns: inject a random tag before the @
+            if (str_contains($lowerColumn, 'email')) {
+                $atPos = strpos($value, '@');
+                if ($atPos !== false) {
+                    $local = substr($value, 0, $atPos);
+                    $domain = substr($value, $atPos);
+                    $mutated = $local.'+'.Str::random(4).$domain;
+                    $row[$column] = $maxLen !== null ? mb_substr($mutated, 0, $maxLen) : $mutated;
+                }
+                continue;
+            }
+
+            // All other mutable columns: append a short random suffix
+            $suffixLength = 5; // "-" + 4 random chars
+            $suffix = '-'.Str::random(4);
+
+            if ($maxLen !== null) {
+                $baseLen = max(1, $maxLen - $suffixLength);
+                $row[$column] = mb_substr($value, 0, $baseLen).$suffix;
+            } else {
+                $row[$column] = $value.$suffix;
+            }
+        }
+
+        return $row;
     }
 
     /**
@@ -485,5 +551,25 @@ class AiSeedCommand extends Command
         }
 
         return $nonMutable;
+    }
+
+    /**
+     * Resolve a map of column name → max_length from the schema.
+     *
+     * Used by insertWithRetry to ensure mutated values stay within DB limits.
+     *
+     * @return array<string, int>
+     */
+    private function resolveColumnMaxLengths(array $schema): array
+    {
+        $maxLengths = [];
+
+        foreach ($schema['columns'] as $column) {
+            if (($column['max_length'] ?? null) !== null) {
+                $maxLengths[$column['name']] = $column['max_length'];
+            }
+        }
+
+        return $maxLengths;
     }
 }

@@ -181,7 +181,14 @@ class DataGenerator implements DataGeneratorInterface
         }
 
         if ($column['is_json'] ?? false) {
-            $parts[] = 'JSON COLUMN — return a JSON Object {"key":"value"} for key-value data, or a JSON Array ["item"] for lists. NEVER return a plain string or a flat alternating array like ["key","value","key2","value2"]';
+            $name = strtolower($column['name']);
+            $listPatterns = ['objectives', 'prerequisites', 'keywords', 'tags', 'skills', 'features', 'items', 'categories', 'roles', 'permissions', 'images', 'attachments', 'links', 'recipients', 'emails', 'phones', 'languages', 'topics', 'benefits', 'requirements', 'highlights', 'amenities', 'options'];
+
+            if (in_array($name, $listPatterns, true) || str_ends_with($name, 's')) {
+                $parts[] = 'JSON COLUMN — this column represents a list of items. You MUST return a flat JSON Array of strings like ["item1","item2","item3"]. Do NOT return a JSON Object.';
+            } else {
+                $parts[] = 'JSON COLUMN — this column represents structured key-value data. You MUST return a JSON Object like {"key":"value"}. Do NOT return a flat array.';
+            }
         }
 
         return implode('. ', $parts);
@@ -226,7 +233,14 @@ class DataGenerator implements DataGeneratorInterface
             }
 
             if ($column['is_json'] ?? false) {
-                $desc .= ' [JSON — return Object {} for key-value data, Array [] for lists only]';
+                $colName = strtolower($column['name']);
+                $listPatterns = ['objectives', 'prerequisites', 'keywords', 'tags', 'skills', 'features', 'items', 'categories', 'roles', 'permissions', 'images', 'attachments', 'links', 'recipients', 'emails', 'phones', 'languages', 'topics', 'benefits', 'requirements', 'highlights', 'amenities', 'options'];
+
+                if (in_array($colName, $listPatterns, true) || str_ends_with($colName, 's')) {
+                    $desc .= ' [JSON — MUST be a flat Array of strings like ["item1","item2"]]';
+                } else {
+                    $desc .= ' [JSON — MUST be an Object like {"key":"value"}]';
+                }
                 $jsonColumnNames[] = $column['name'];
             }
 
@@ -244,10 +258,9 @@ class DataGenerator implements DataGeneratorInterface
             CRITICAL JSON RULE:
             The following columns are JSON columns: {$names}.
             For these columns you MUST return a valid JSON structure, NOT a plain string.
-            - If the data has named keys (like location, date, settings), return a JSON Object: {"location": "Riyadh", "date": "2024-01-01"}
-            - If the data is a simple list of items, return a JSON Array: ["item1", "item2"]
-            - NEVER output a flat sequential array of alternating keys and values like ["location", "Riyadh", "date", "2024-01-01"]
-            - When PHP validation rules define an 'array' with dot-notation sub-keys (e.g., content.location, content.date), you MUST use a JSON Object {}, NOT a sequential array [].
+            - If the column name implies a list of items (e.g., objectives, prerequisites, keywords, tags, skills, features — typically plural nouns), you MUST return a flat JSON Array of strings: ["item1", "item2", "item3"]. Do NOT wrap list data in an Object.
+            - If the column name implies key-value/structured data (e.g., content, conditions, settings, metadata, config), or PHP validation rules use dot-notation sub-keys (e.g., content.location), you MUST return a JSON Object: {"key": "value"}.
+            - NEVER output a flat sequential array of alternating keys and values like ["location", "Riyadh", "date", "2024-01-01"]. That is ALWAYS wrong.
             WARNING;
         }
 
@@ -465,7 +478,6 @@ class DataGenerator implements DataGeneratorInterface
                 }
             }
 
-            // ...existing code...
             // Inject ULID/UUID primary key
             if ($primaryKeyColumn) {
                 $row[$primaryKeyColumn] = match ($primaryKeyType) {
