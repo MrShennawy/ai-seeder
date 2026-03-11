@@ -76,7 +76,7 @@ class SchemaAnalyzer implements SchemaAnalyzerInterface
     /**
      * Extract column metadata from a table.
      *
-     * @return array<int, array{name: string, type: string, nullable: bool, unique: bool, auto_increment: bool, primary_key: bool, is_json: bool, key_type: string, max_length: int|null, enum_values: array<int, string>, is_password: bool}>
+     * @return array<int, array{name: string, type: string, nullable: bool, unique: bool, auto_increment: bool, primary_key: bool, is_json: bool, key_type: string, max_length: int|null, enum_values: array<int, string>, is_password: bool, is_datetime: bool}>
      */
     private function extractColumns(string $table): array
     {
@@ -91,6 +91,7 @@ class SchemaAnalyzer implements SchemaAnalyzerInterface
             $isAutoIncrement = $column['auto_increment'] ?? false;
             $typeName = strtolower($column['type_name']);
             $fullType = $column['type'] ?? $column['type_name'];
+            $isDateTime = $this->isDateTimeColumn($column['name'], $typeName);
 
             return [
                 'name' => $column['name'],
@@ -104,6 +105,7 @@ class SchemaAnalyzer implements SchemaAnalyzerInterface
                 'max_length' => $this->extractMaxLength($fullType, $typeName),
                 'enum_values' => $this->extractEnumValues($fullType, $typeName),
                 'is_password' => $this->isPasswordColumn($column['name']),
+                'is_datetime' => $isDateTime,
             ];
         }, $schemaColumns);
     }
@@ -205,6 +207,22 @@ class SchemaAnalyzer implements SchemaAnalyzerInterface
     private function isPasswordColumn(string $columnName): bool
     {
         return in_array(strtolower($columnName), self::PASSWORD_COLUMN_NAMES, true);
+    }
+
+    /**
+     * Determine whether a column is a date/datetime/timestamp column.
+     * Excludes native Laravel timestamps (created_at, updated_at, deleted_at).
+     */
+    private function isDateTimeColumn(string $columnName, string $typeName): bool
+    {
+        // Exclude native Laravel timestamps
+        $nativeTimestamps = ['created_at', 'updated_at', 'deleted_at'];
+        if (in_array(strtolower($columnName), $nativeTimestamps, true)) {
+            return false;
+        }
+
+        // Check if the column type is date, datetime, or timestamp
+        return in_array($typeName, ['date', 'datetime', 'timestamp', 'datetimetz'], true);
     }
 
     /**

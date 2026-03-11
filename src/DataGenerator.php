@@ -153,6 +153,12 @@ class DataGenerator implements DataGeneratorInterface
 
         $parts[] = "Database type: {$column['type']}";
 
+        // Add critical datetime formatting rule for date/datetime/timestamp columns
+        $dateTimeTypes = ['date', 'datetime', 'timestamp', 'datetimetz'];
+        if (in_array(strtolower($column['type']), $dateTimeTypes, true)) {
+            $parts[] = "CRITICAL: You MUST format this date exactly as 'YYYY-MM-DD HH:MM:SS' (e.g., '2024-01-15 10:00:00'). DO NOT use ISO 8601, and DO NOT include 'T' or 'Z'.";
+        }
+
         $maxLength = $column['max_length'] ?? null;
 
         if ($maxLength !== null) {
@@ -342,6 +348,7 @@ class DataGenerator implements DataGeneratorInterface
     /**
      * Post-process AI-generated rows:
      * - Sanitize string "null" → actual null for nullable columns
+     * - Convert ISO 8601 datetime strings to MySQL YYYY-MM-DD HH:MM:SS format
      * - Inject ULID/UUID primary keys
      * - Inject hashed passwords for password columns
      * - Inject random valid foreign key IDs from resolved parent tables
@@ -363,6 +370,7 @@ class DataGenerator implements DataGeneratorInterface
         $enumConstraints = [];
         $nullableColumns = [];
         $timestampColumns = [];
+        $dateTimeColumns = [];
 
         foreach ($schema['columns'] as $column) {
             if (($column['primary_key'] ?? false) && in_array($column['key_type'] ?? '', ['ulid', 'uuid'], true)) {
@@ -394,6 +402,11 @@ class DataGenerator implements DataGeneratorInterface
             if (in_array($column['name'], self::TIMESTAMP_COLUMNS, true)) {
                 $timestampColumns[] = $column['name'];
             }
+
+            // Track date/datetime/timestamp columns that need formatting sanitation
+            if ($column['is_datetime'] ?? false) {
+                $dateTimeColumns[] = $column['name'];
+            }
         }
 
         $now = now()->format('Y-m-d H:i:s');
@@ -408,6 +421,7 @@ class DataGenerator implements DataGeneratorInterface
             $foreignKeyConstraints,
             $nullableColumns,
             $timestampColumns,
+            $dateTimeColumns,
             $now,
         ): array {
             // --- Data Sanitation: string "null" → actual null ---
@@ -424,6 +438,34 @@ class DataGenerator implements DataGeneratorInterface
                     $row[$nullableColumn] = null;
                 }
             }
+
+            // --- Data Sanitation: ISO 8601 → MySQL datetime format ---
+            // LLMs often generate ISO 8601 datetime strings (e.g., '2024-01-15T10:00:00Z')
+            // which MySQL rejects. Convert them to MySQL format: 'YYYY-MM-DD HH:MM:SS'
+            foreach ($dateTimeColumns as $dateTimeColumn) {
+                if (! array_key_exists($dateTimeColumn, $row)) {
+                    continue;
+                }
+
+                $value = $row[$dateTimeColumn];
+
+                if (is_null($value)) {
+                    continue;
+                }
+
+                // Check if value matches ISO 8601 datetime pattern (contains 'T' and 'Z' or timezone offset)
+                if (is_string($value) && preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/', $value)) {
+                    try {
+                        // Parse ISO 8601 datetime and convert to MySQL format
+                        $row[$dateTimeColumn] = \Illuminate\Support\Carbon::parse($value)->toDateTimeString();
+                    } catch (\Throwable) {
+                        // If parsing fails, leave the value as-is and let MySQL validation catch it
+                        // This ensures we don't silently drop invalid data
+                    }
+                }
+            }
+
+            // ...existing code...
             // Inject ULID/UUID primary key
             if ($primaryKeyColumn) {
                 $row[$primaryKeyColumn] = match ($primaryKeyType) {

@@ -44,6 +44,7 @@ class SeederAgent implements Agent, HasStructuredOutput, HasTools
         9. For columns with a MAX LENGTH constraint, your value MUST NOT exceed that character limit. For example, a column with MAX 2 chars should get values like "en", "ar", "fr" — NOT "English".
         10. For ENUM columns, you MUST select ONLY from the listed allowed values. Do NOT invent new values.
         11. CRITICAL JSON OBJECT RULE: When validation rules or context code define an 'array' with dot-notation sub-keys (e.g., content.location, content.date), you MUST format the output as a JSON Object (key-value map) like {"location": "Riyadh", "date": "2024-01-01"}. NEVER output a flat sequential array of alternating keys and values like ["location", "Riyadh", "date", "2024-01-01"]. Use {} for key-value data, [] only for simple lists.
+        12. CRITICAL DATETIME RULE: For any date, datetime, or timestamp columns, you MUST format dates exactly as 'YYYY-MM-DD HH:MM:SS' (e.g., '2024-01-15 10:00:00'). DO NOT use ISO 8601 format with 'T' or 'Z' — MySQL will reject it. Always use spaces between date and time components.
         INSTRUCTIONS;
 
         $languageRule = $this->buildLanguageRule();
