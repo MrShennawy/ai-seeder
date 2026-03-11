@@ -5,7 +5,10 @@ declare(strict_types=1);
 namespace Shennawy\AiSeeder;
 
 use Closure;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use Shennawy\AiSeeder\Contracts\DataGeneratorInterface;
 use Shennawy\AiSeeder\Contracts\RelationshipResolverInterface;
 use Shennawy\AiSeeder\Contracts\SchemaAnalyzerInterface;
@@ -83,6 +86,8 @@ class AiSeederOrchestrator
             minimumParentRows: min($count, 5),
         );
 
+        $nonMutableColumns = $this->resolveNonMutableColumns($schema);
+
         $totalInserted = 0;
         $chunks = (int) ceil($count / $chunkSize);
 
@@ -100,7 +105,9 @@ class AiSeederOrchestrator
 
             $this->tokenTracker->add($result->promptTokens, $result->completionTokens);
 
-            DB::table($table)->insert($result->rows);
+            foreach ($result->rows as $row) {
+                $this->insertWithRetry($table, $row, $nonMutableColumns);
+            }
 
             $totalInserted += count($result->rows);
 
@@ -112,6 +119,75 @@ class AiSeederOrchestrator
         }
 
         return $totalInserted;
+    }
+
+    /**
+     * Insert a single row with auto-mutation retry on unique constraint violations.
+     *
+     * @param  array<string, mixed>  $row
+     * @param  array<int, string>  $nonMutableColumns
+     *
+     * @throws QueryException If the error is not a unique constraint violation or all retries fail.
+     */
+    private function insertWithRetry(string $table, array $row, array $nonMutableColumns, int $maxRetries = 3): void
+    {
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+            try {
+                DB::table($table)->insert($row);
+
+                return;
+            } catch (QueryException $e) {
+                if ($e->errorInfo[0] !== '23000' || ($e->errorInfo[1] ?? 0) != 1062) {
+                    throw $e;
+                }
+
+                if ($attempt === $maxRetries) {
+                    throw $e;
+                }
+
+                foreach ($row as $column => $value) {
+                    if (in_array($column, $nonMutableColumns, true)) {
+                        continue;
+                    }
+
+                    if (is_string($value) && $value !== '') {
+                        $row[$column] = $value.'-'.Str::random(4);
+                    }
+                }
+
+                Log::warning("AiSeeder: Duplicate entry for [{$table}] — mutated row and retrying (attempt {$attempt}/{$maxRetries}).");
+            }
+        }
+    }
+
+    /**
+     * Resolve column names that should NOT be mutated during duplicate-entry retries.
+     *
+     * @return array<int, string>
+     */
+    private function resolveNonMutableColumns(array $schema): array
+    {
+        $nonMutable = [];
+        $foreignKeyColumns = array_map(fn (array $fk) => $fk['column'], $schema['foreign_keys'] ?? []);
+
+        foreach ($schema['columns'] as $column) {
+            $name = $column['name'];
+
+            $shouldSkip = ($column['primary_key'] ?? false)
+                || ($column['auto_increment'] ?? false)
+                || ($column['is_json'] ?? false)
+                || ($column['is_password'] ?? false)
+                || ($column['is_datetime'] ?? false)
+                || ! empty($column['enum_values'] ?? [])
+                || in_array($name, $foreignKeyColumns, true)
+                || in_array($name, ['created_at', 'updated_at', 'deleted_at'], true);
+
+            if ($shouldSkip) {
+                $nonMutable[] = $name;
+            }
+        }
+
+        return $nonMutable;
     }
 
     /**

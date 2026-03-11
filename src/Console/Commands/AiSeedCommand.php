@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Shennawy\AiSeeder\Console\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Shennawy\AiSeeder\ContextExtractor;
 use Shennawy\AiSeeder\Contracts\DataGeneratorInterface;
 use Shennawy\AiSeeder\Contracts\RelationshipResolverInterface;
@@ -19,7 +21,6 @@ use function Laravel\Prompts\info;
 use function Laravel\Prompts\intro;
 use function Laravel\Prompts\note;
 use function Laravel\Prompts\outro;
-use function Laravel\Prompts\progress;
 use function Laravel\Prompts\search;
 use function Laravel\Prompts\spin;
 use function Laravel\Prompts\table;
@@ -136,6 +137,13 @@ class AiSeedCommand extends Command
         $totalInserted = 0;
         $tokenTracker = new TokenUsageTracker;
 
+        // Schema metadata for the auto-mutation retry logic
+        $nonMutableColumns = $this->resolveNonMutableColumns($schema);
+
+        // Single global progress bar across all chunks
+        $progress = new \Laravel\Prompts\Progress('💾 Inserting rows into ['.$table.']', $count);
+        $progress->start();
+
         try {
             for ($chunk = 1; $chunk <= $chunks; $chunk++) {
                 $remaining = $count - $totalInserted;
@@ -160,21 +168,15 @@ class AiSeedCommand extends Command
 
                 note('  ✓ AI returned '.count($result->rows)." row(s). Tokens: {$result->promptTokens} prompt + {$result->completionTokens} completion.");
 
-                // 5b: Database insertion with progress bar
-                $label = "💾 Inserting chunk {$chunk}/{$chunks} into [{$table}]";
-
-                progress(
-                    label: $label,
-                    steps: $result->rows,
-                    callback: function (array $row) use ($table): void {
-                        DB::table($table)->insert($row);
-                    },
-                    hint: 'Inserting rows one-by-one...',
-                );
-
-                $totalInserted += count($result->rows);
+                // 5b: Insert rows one-by-one with duplicate auto-mutation
+                foreach ($result->rows as $row) {
+                    $this->insertWithRetry($table, $row, $nonMutableColumns);
+                    $totalInserted++;
+                    $progress->advance();
+                }
             }
         } catch (\Throwable $e) {
+            $progress->finish();
             $this->newLine();
             error("Failed to seed [{$table}]: {$e->getMessage()}");
 
@@ -186,6 +188,8 @@ class AiSeedCommand extends Command
 
             return self::FAILURE;
         }
+
+        $progress->finish();
 
         // ── Step 6: Summary ──
         $this->newLine();
@@ -378,5 +382,83 @@ class AiSeedCommand extends Command
                 ['Total tokens', number_format($tracker->getTotalTokens())],
             ],
         );
+    }
+
+    /**
+     * Insert a single row into the database, with auto-mutation retry
+     * on unique constraint violations (SQLSTATE 23000 / error code 1062).
+     *
+     * If a duplicate entry is detected, mutable string columns are suffixed
+     * with a random string to force uniqueness, and the row is re-inserted.
+     *
+     * @param  array<string, mixed>  $row
+     * @param  array<int, string>  $nonMutableColumns  Column names that should NOT be mutated (JSON, dates, FKs, enums, etc.)
+     *
+     * @throws QueryException  If the error is not a unique constraint violation or retry also fails.
+     */
+    private function insertWithRetry(string $table, array $row, array $nonMutableColumns, int $maxRetries = 3): void
+    {
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+            try {
+                DB::table($table)->insert($row);
+
+                return;
+            } catch (QueryException $e) {
+                // Only handle unique constraint violations (SQLSTATE 23000, MySQL error 1062)
+                if ($e->errorInfo[0] !== '23000' || ($e->errorInfo[1] ?? 0) != 1062) {
+                    throw $e;
+                }
+
+                if ($attempt === $maxRetries) {
+                    throw $e;
+                }
+
+                // Mutate mutable string columns to force uniqueness
+                foreach ($row as $column => $value) {
+                    if (in_array($column, $nonMutableColumns, true)) {
+                        continue;
+                    }
+
+                    if (is_string($value) && $value !== '') {
+                        $row[$column] = $value.'-'.Str::random(4);
+                    }
+                }
+
+                warning("  ⚠ Duplicate entry detected — mutated row and retrying (attempt {$attempt}/{$maxRetries})...");
+            }
+        }
+    }
+
+    /**
+     * Resolve column names that should NOT be mutated during duplicate-entry retries.
+     *
+     * These include: JSON columns, date/datetime/timestamp columns, foreign keys,
+     * ENUM columns, primary keys, password columns, and native timestamp columns.
+     *
+     * @return array<int, string>
+     */
+    private function resolveNonMutableColumns(array $schema): array
+    {
+        $nonMutable = [];
+        $foreignKeyColumns = array_map(fn (array $fk) => $fk['column'], $schema['foreign_keys'] ?? []);
+
+        foreach ($schema['columns'] as $column) {
+            $name = $column['name'];
+
+            $shouldSkip = ($column['primary_key'] ?? false)
+                || ($column['auto_increment'] ?? false)
+                || ($column['is_json'] ?? false)
+                || ($column['is_password'] ?? false)
+                || ($column['is_datetime'] ?? false)
+                || ! empty($column['enum_values'] ?? [])
+                || in_array($name, $foreignKeyColumns, true)
+                || in_array($name, ['created_at', 'updated_at', 'deleted_at'], true);
+
+            if ($shouldSkip) {
+                $nonMutable[] = $name;
+            }
+        }
+
+        return $nonMutable;
     }
 }
