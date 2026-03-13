@@ -36,7 +36,7 @@ class AiSeedCommand extends Command
         {--count=10 : Number of rows to generate}
         {--chunk=50 : Rows per AI request chunk}
         {--lang= : Language(s) for generated text — single code (e.g., fr) or comma-separated (e.g., ar,en)}
-        {--context= : Fully-qualified class name for business logic context (e.g., App\\Http\\Requests\\StorePostRequest)}';
+        {--context=* : Context sources — class names, file paths, or inline text (repeatable)}';
 
     /**
      * The console command description.
@@ -266,38 +266,61 @@ class AiSeedCommand extends Command
     }
 
     /**
-     * Resolve the code context — from --context option.
+     * Resolve the code/file context — from --context option(s).
      *
-     * Uses ReflectionClass to locate and read the source file of the given class.
+     * Accepts multiple sources: PHP class names, file paths (any type), or raw inline text.
+     * Each --context value is resolved independently and concatenated.
      * Returns null if no context is provided.
      */
     private function resolveContext(): ?string
     {
-        $className = $this->option('context');
+        /** @var array<int, string> $contextInputs */
+        $contextInputs = $this->option('context');
 
-        if (! is_string($className) || trim($className) === '') {
+        if (empty($contextInputs)) {
             return null;
         }
-
-        $className = trim($className);
-
-        info("📄 Loading code context from: {$className}");
 
         $extractor = new ContextExtractor;
+        $contextBlocks = [];
 
-        try {
-            $code = $extractor->extract($className);
+        foreach ($contextInputs as $input) {
+            $input = trim($input);
 
-            $lineCount = substr_count($code, "\n") + 1;
-            note("  ✓ Loaded {$lineCount} lines of source code for AI context.");
+            if ($input === '') {
+                continue;
+            }
 
-            return $code;
-        } catch (\RuntimeException $e) {
-            error("  ✗ {$e->getMessage()}");
-            warning('  Continuing without code context.');
+            info("📄 Loading context: {$input}");
 
+            try {
+                $result = $extractor->extract($input);
+
+                $lineCount = substr_count($result['content'], "\n") + 1;
+                note("  ✓ [{$result['label']}] — {$lineCount} lines loaded.");
+
+                $contextBlocks[] = $result;
+            } catch (\RuntimeException $e) {
+                error("  ✗ {$e->getMessage()}");
+                warning('  Skipping this context source.');
+            }
+        }
+
+        if (empty($contextBlocks)) {
             return null;
         }
+
+        // Combine all context blocks into a single string
+        $combined = '';
+
+        foreach ($contextBlocks as $index => $block) {
+            $number = $index + 1;
+            $combined .= "\n--- Context Source #{$number}: {$block['label']} ---\n";
+            $combined .= $block['content'];
+            $combined .= "\n";
+        }
+
+        return $combined;
     }
 
     /**

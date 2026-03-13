@@ -586,10 +586,9 @@ test('buildContextSection injects PHP code when provided', function () {
 
     $result = $method->invoke($generator, $fakeCode);
 
-    expect($result)->toContain('BUSINESS LOGIC & VALIDATION RULES');
-    expect($result)->toContain('deeply analyze this code');
+    expect($result)->toContain('BUSINESS LOGIC, RULES & ADDITIONAL CONTEXT');
+    expect($result)->toContain('deeply analyze ALL of them');
     expect($result)->toContain($fakeCode);
-    expect($result)->toContain('```php');
 });
 
 test('buildPrompt includes context section when contextCode is provided', function () {
@@ -610,7 +609,7 @@ test('buildPrompt includes context section when contextCode is provided', functi
 
     $prompt = $method->invoke($generator, $schema, 3, 'en', $contextCode);
 
-    expect($prompt)->toContain('BUSINESS LOGIC & VALIDATION RULES');
+    expect($prompt)->toContain('BUSINESS LOGIC, RULES & ADDITIONAL CONTEXT');
     expect($prompt)->toContain('OrderRequest');
     expect($prompt)->toContain('required|numeric|min:0');
 });
@@ -631,7 +630,7 @@ test('buildPrompt does not include context section when contextCode is null', fu
 
     $prompt = $method->invoke($generator, $schema, 3, 'en', null);
 
-    expect($prompt)->not->toContain('BUSINESS LOGIC & VALIDATION RULES');
+    expect($prompt)->not->toContain('BUSINESS LOGIC, RULES & ADDITIONAL CONTEXT');
 });
 
 test('SeederAgent schema does not contain additionalProperties key (Gemini compatibility)', function () {

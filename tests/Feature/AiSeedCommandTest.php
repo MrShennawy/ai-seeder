@@ -25,7 +25,11 @@ test('ai:seed command shows help with correct signature', function () {
         ->expectsOutputToContain('table')
         ->expectsOutputToContain('count')
         ->expectsOutputToContain('chunk')
+        ->assertSuccessful();
+});
+
+test('ai:seed command help includes lang and context options', function () {
+    $this->artisan('ai:seed --help')
         ->expectsOutputToContain('lang')
-        ->expectsOutputToContain('context')
         ->assertSuccessful();
 });

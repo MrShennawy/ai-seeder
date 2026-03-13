@@ -314,11 +314,12 @@ class DataGenerator implements DataGeneratorInterface
     }
 
     /**
-     * Build a context section for the AI prompt from raw PHP source code.
+     * Build a context section for the AI prompt from one or more context sources.
      *
-     * When provided, this injects the full source of a related class
-     * (FormRequest, Model, etc.) so the AI can analyze validation rules,
-     * morph maps, casts, and other code-defined constraints.
+     * Accepts the combined context string which may include PHP classes,
+     * file contents (Markdown, JSON, YAML, etc.), or raw inline text.
+     * The AI uses this to deeply analyze business logic, validation rules,
+     * morph maps, casts, and other code/documentation-defined constraints.
      */
     private function buildContextSection(?string $contextCode): string
     {
@@ -328,14 +329,12 @@ class DataGenerator implements DataGeneratorInterface
 
         return <<<CONTEXT
 
-        ### BUSINESS LOGIC & VALIDATION RULES ###
-        Below is the raw PHP code defining the rules and relationships for this data.
-        You MUST deeply analyze this code (e.g., conditional validation rules, morph maps, custom casts, JSON structure definitions).
-        Ensure your generated JSON fully complies with these strict rules:
+        ### BUSINESS LOGIC, RULES & ADDITIONAL CONTEXT ###
+        Below are one or more context sources (PHP code, documentation, configuration, or free-form instructions).
+        You MUST deeply analyze ALL of them (e.g., conditional validation rules, morph maps, custom casts, JSON structure definitions, data dictionaries, domain constraints).
+        Ensure your generated JSON fully complies with every rule and constraint found in this context:
 
-        ```php
         {$contextCode}
-        ```
         CONTEXT;
     }
 

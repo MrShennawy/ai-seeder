@@ -20,7 +20,7 @@ interface DataGeneratorInterface
      * }  $schema
      * @param  array<string, array<int, int|string>>  $foreignKeyConstraints
      * @param  string  $language  Language code: 'en', 'ar', or 'mixed'
-     * @param  string|null  $contextCode  Raw PHP source code for business logic context (FormRequest, Model, etc.)
+     * @param  string|null  $contextCode  Combined context from any source (PHP classes, files, inline text)
      */
     public function generate(array $schema, int $count, array $foreignKeyConstraints = [], string $language = 'en', ?string $contextCode = null): GenerationResult;
 }
