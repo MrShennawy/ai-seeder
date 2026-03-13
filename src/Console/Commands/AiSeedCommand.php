@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Shennawy\AiSeeder\Console\Commands;
 
 use Illuminate\Console\Command;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Shennawy\AiSeeder\ContextExtractor;
 use Shennawy\AiSeeder\Contracts\DataGeneratorInterface;
 use Shennawy\AiSeeder\Contracts\RelationshipResolverInterface;
@@ -19,7 +21,6 @@ use function Laravel\Prompts\info;
 use function Laravel\Prompts\intro;
 use function Laravel\Prompts\note;
 use function Laravel\Prompts\outro;
-use function Laravel\Prompts\progress;
 use function Laravel\Prompts\search;
 use function Laravel\Prompts\spin;
 use function Laravel\Prompts\table;
@@ -42,6 +43,14 @@ class AiSeedCommand extends Command
      * The console command description.
      */
     protected $description = 'Generate smart, context-aware dummy data for a database table using AI';
+
+    /**
+     * Buffered warnings collected during the silent progress-bar loop.
+     * Printed only after the progress bar is safely closed.
+     *
+     * @var array<int, string>
+     */
+    private array $bufferedWarnings = [];
 
     public function __construct(
         private readonly SchemaAnalyzerInterface $schemaAnalyzer,
@@ -135,46 +144,47 @@ class AiSeedCommand extends Command
         // ── Step 5: Generate & insert per chunk ──
         $totalInserted = 0;
         $tokenTracker = new TokenUsageTracker;
+        $this->bufferedWarnings = [];
+
+        // Schema metadata for the auto-mutation retry logic
+        $nonMutableColumns = $this->resolveNonMutableColumns($schema);
+        $columnMaxLengths = $this->resolveColumnMaxLengths($schema);
+
+        // Single global progress bar — absolutely ZERO console output inside the loop.
+        $progress = new \Laravel\Prompts\Progress('🧠 Generating and inserting AI data', $chunks);
+        $progress->start();
 
         try {
             for ($chunk = 1; $chunk <= $chunks; $chunk++) {
                 $remaining = $count - $totalInserted;
                 $currentChunkSize = min($chunkSize, $remaining);
 
-                // 5a: AI generation with spinner
-                info("🧠 Generating chunk {$chunk}/{$chunks} ({$currentChunkSize} rows)...");
+                $progress->hint("Waiting for AI… chunk {$chunk}/{$chunks} ({$currentChunkSize} rows)");
+                $progress->render();
 
-                /** @var GenerationResult $result */
-                $result = spin(
-                    callback: fn () => $this->dataGenerator->generate(
-                        $schema,
-                        $currentChunkSize,
-                        $foreignKeyConstraints,
-                        $language,
-                        $contextCode,
-                    ),
-                    message: 'Waiting for AI to generate data (this may take a moment)...',
+                $result = $this->dataGenerator->generate(
+                    $schema,
+                    $currentChunkSize,
+                    $foreignKeyConstraints,
+                    $language,
+                    $contextCode,
                 );
 
                 $tokenTracker->add($result->promptTokens, $result->completionTokens);
 
-                note('  ✓ AI returned '.count($result->rows)." row(s). Tokens: {$result->promptTokens} prompt + {$result->completionTokens} completion.");
+                $progress->hint("Inserting chunk {$chunk}/{$chunks} into [{$table}]…");
+                $progress->render();
 
-                // 5b: Database insertion with progress bar
-                $label = "💾 Inserting chunk {$chunk}/{$chunks} into [{$table}]";
+                foreach ($result->rows as $row) {
+                    $this->insertWithRetry($table, $row, $nonMutableColumns, $columnMaxLengths);
+                    $totalInserted++;
+                }
 
-                progress(
-                    label: $label,
-                    steps: $result->rows,
-                    callback: function (array $row) use ($table): void {
-                        DB::table($table)->insert($row);
-                    },
-                    hint: 'Inserting rows one-by-one...',
-                );
-
-                $totalInserted += count($result->rows);
+                $progress->advance();
             }
         } catch (\Throwable $e) {
+            $progress->finish();
+            $this->flushBufferedWarnings();
             $this->newLine();
             error("Failed to seed [{$table}]: {$e->getMessage()}");
 
@@ -186,6 +196,9 @@ class AiSeedCommand extends Command
 
             return self::FAILURE;
         }
+
+        $progress->finish();
+        $this->flushBufferedWarnings();
 
         // ── Step 6: Summary ──
         $this->newLine();
@@ -401,5 +414,185 @@ class AiSeedCommand extends Command
                 ['Total tokens', number_format($tracker->getTotalTokens())],
             ],
         );
+    }
+
+    /**
+     * Insert a single row into the database, with auto-mutation retry
+     * on unique constraint violations (SQLSTATE 23000 / error code 1062).
+     *
+     * Uses a smart, column-name-aware mutation strategy:
+     * - Phone columns: replaces trailing digits to keep a valid format.
+     * - Email columns: injects a random tag before the @ sign.
+     * - Other known unique-prone columns (code, slug, sku, username): appends a short suffix.
+     * - Generic long strings (>15 chars): appends a suffix as a fallback.
+     * - Short generic strings (language, status, etc.): never touched.
+     *
+     * All mutations respect the column's max_length from the schema.
+     *
+     * Warnings are buffered (not printed) so the progress bar is never interrupted.
+     *
+     * @param  array<string, mixed>  $row
+     * @param  array<int, string>  $nonMutableColumns  Column names that should NOT be mutated
+     * @param  array<string, int>  $columnMaxLengths  Column name → max_length map from schema
+     *
+     * @throws QueryException  If the error is not a unique constraint violation or all retries fail.
+     */
+    private function insertWithRetry(string $table, array $row, array $nonMutableColumns, array $columnMaxLengths = [], int $maxRetries = 3): void
+    {
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+            try {
+                DB::table($table)->insert($row);
+
+                return;
+            } catch (QueryException $e) {
+                if ($e->errorInfo[0] !== '23000' || ($e->errorInfo[1] ?? 0) != 1062) {
+                    throw $e;
+                }
+
+                if ($attempt === $maxRetries) {
+                    throw $e;
+                }
+
+                $row = $this->mutateRowForUniqueness($row, $nonMutableColumns, $columnMaxLengths);
+
+                $this->bufferedWarnings[] = "Duplicate entry in [{$table}] — mutated row and retried (attempt {$attempt}/{$maxRetries}).";
+            }
+        }
+    }
+
+    /**
+     * Mutate a row's string values to resolve a unique constraint violation.
+     *
+     * @param  array<string, mixed>  $row
+     * @param  array<int, string>  $nonMutableColumns
+     * @param  array<string, int>  $columnMaxLengths
+     * @return array<string, mixed>
+     */
+    private function mutateRowForUniqueness(array $row, array $nonMutableColumns, array $columnMaxLengths): array
+    {
+        // Column names that are commonly subject to unique constraints.
+        // These are ALWAYS eligible for mutation regardless of string length.
+        $knownUniqueColumns = ['email', 'phone', 'code', 'slug', 'username', 'sku', 'mobile', 'telephone', 'coupon_code'];
+
+        foreach ($row as $column => $value) {
+            if (in_array($column, $nonMutableColumns, true)) {
+                continue;
+            }
+
+            if (! is_string($value) || $value === '') {
+                continue;
+            }
+
+            $lowerColumn = strtolower($column);
+            $isKnownUnique = in_array($lowerColumn, $knownUniqueColumns, true)
+                || str_contains($lowerColumn, 'phone')
+                || str_contains($lowerColumn, 'email')
+                || str_contains($lowerColumn, 'slug');
+
+            // Skip short generic strings that are unlikely to be unique-constrained
+            if (! $isKnownUnique && mb_strlen($value) <= 15) {
+                continue;
+            }
+
+            $maxLen = $columnMaxLengths[$column] ?? null;
+
+            // Phone columns: replace trailing digits to keep a valid phone format
+            if (str_contains($lowerColumn, 'phone') || str_contains($lowerColumn, 'mobile') || $lowerColumn === 'telephone') {
+                $row[$column] = preg_replace('/\d{4}$/', (string) rand(1000, 9999), $value) ?? $value;
+                continue;
+            }
+
+            // Email columns: inject a random tag before the @
+            if (str_contains($lowerColumn, 'email')) {
+                $atPos = strpos($value, '@');
+                if ($atPos !== false) {
+                    $local = substr($value, 0, $atPos);
+                    $domain = substr($value, $atPos);
+                    $mutated = $local.'+'.Str::random(4).$domain;
+                    $row[$column] = $maxLen !== null ? mb_substr($mutated, 0, $maxLen) : $mutated;
+                }
+                continue;
+            }
+
+            // All other mutable columns: append a short random suffix
+            $suffixLength = 5; // "-" + 4 random chars
+            $suffix = '-'.Str::random(4);
+
+            if ($maxLen !== null) {
+                $baseLen = max(1, $maxLen - $suffixLength);
+                $row[$column] = mb_substr($value, 0, $baseLen).$suffix;
+            } else {
+                $row[$column] = $value.$suffix;
+            }
+        }
+
+        return $row;
+    }
+
+    /**
+     * Flush all buffered warnings to the console.
+     *
+     * Must only be called AFTER the progress bar has been closed with finish().
+     */
+    private function flushBufferedWarnings(): void
+    {
+        foreach ($this->bufferedWarnings as $msg) {
+            warning("  ⚠ {$msg}");
+        }
+
+        $this->bufferedWarnings = [];
+    }
+
+    /**
+     * Resolve column names that should NOT be mutated during duplicate-entry retries.
+     *
+     * These include: JSON columns, date/datetime/timestamp columns, foreign keys,
+     * ENUM columns, primary keys, password columns, and native timestamp columns.
+     *
+     * @return array<int, string>
+     */
+    private function resolveNonMutableColumns(array $schema): array
+    {
+        $nonMutable = [];
+        $foreignKeyColumns = array_map(fn (array $fk) => $fk['column'], $schema['foreign_keys'] ?? []);
+
+        foreach ($schema['columns'] as $column) {
+            $name = $column['name'];
+
+            $shouldSkip = ($column['primary_key'] ?? false)
+                || ($column['auto_increment'] ?? false)
+                || ($column['is_json'] ?? false)
+                || ($column['is_password'] ?? false)
+                || ($column['is_datetime'] ?? false)
+                || ! empty($column['enum_values'] ?? [])
+                || in_array($name, $foreignKeyColumns, true)
+                || in_array($name, ['created_at', 'updated_at', 'deleted_at'], true);
+
+            if ($shouldSkip) {
+                $nonMutable[] = $name;
+            }
+        }
+
+        return $nonMutable;
+    }
+
+    /**
+     * Resolve a map of column name → max_length from the schema.
+     *
+     * Used by insertWithRetry to ensure mutated values stay within DB limits.
+     *
+     * @return array<string, int>
+     */
+    private function resolveColumnMaxLengths(array $schema): array
+    {
+        $maxLengths = [];
+
+        foreach ($schema['columns'] as $column) {
+            if (($column['max_length'] ?? null) !== null) {
+                $maxLengths[$column['name']] = $column['max_length'];
+            }
+        }
+
+        return $maxLengths;
     }
 }
